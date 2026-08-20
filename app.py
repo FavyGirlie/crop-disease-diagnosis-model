@@ -37,7 +37,7 @@ CLASS_NAMES_PATH = APP_DIR / "class_names.json"
 METADATA_PATH = APP_DIR / "metadata.json"
 
 
-HF_REPO_ID = "De-FavouredOne/crop-disease-disease-model"
+HF_REPO_ID = "De-FavouredOne/crop-disease-diagnosis-model"
 HF_MODEL_FILENAME = "model.keras"
 
 
