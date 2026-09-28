@@ -1,4 +1,5 @@
 """AgroVision AI - Smart Agriculture Crop Disease Diagnosis."""
+import html
 import json
 import os
 from pathlib import Path
@@ -6,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, ImageOps
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 
@@ -24,6 +25,17 @@ PREPROCESS_FUNCS = {
     "MobileNetV2": tf.keras.applications.mobilenet_v2.preprocess_input,
     "VGG16": tf.keras.applications.vgg16.preprocess_input,
 }
+
+# ---------- Input validation thresholds (tune these on real test images) ----------
+# The classifier has no "not a leaf" class, so softmax always picks one of the 9
+# crop classes, even for a flyer or a face. These gates stop non-leaf inputs
+# BEFORE the network runs, and weak predictions AFTER it runs.
+MIN_IMAGE_SIDE = 64              # pixels; smaller images carry too little detail
+MIN_LEAF_RATIO = 0.20            # share of pixels that must look like leaf tissue
+MAX_WHITE_RATIO = 0.35           # share of near-white pixels (paper, documents, flyers)
+MAX_DOMINANT_COLOR_RATIO = 0.25  # share taken by ONE exact colour (flat graphics)
+MAX_FLAT_RATIO = 0.70            # share of perfectly flat pixels (graphics, text on paper)
+MIN_CONFIDENCE = 0.50            # top probability below this is not shown as a diagnosis
 
 st.set_page_config(
     page_title="AgroVision AI | Crop Disease Diagnosis",
@@ -44,7 +56,7 @@ section[data-testid="stSidebar"] *{color:#f4fff5!important}
 .hero{position:relative;overflow:hidden;border-radius:28px;padding:45px 48px;margin-bottom:25px;background:linear-gradient(120deg,rgba(10,62,35,.98),rgba(28,105,54,.96));box-shadow:0 20px 50px rgba(25,85,45,.18);color:#fff}.hero-title{font-size:46px;line-height:1.08;font-weight:850;margin:0;max-width:720px}.hero-title span{color:#b8e986}.hero-badge{display:inline-block;background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.16);border-radius:30px;padding:7px 14px;font-size:12px;font-weight:700;margin-bottom:15px}.hero-text{font-size:17px;line-height:1.65;max-width:700px;margin-top:17px;color:rgba(255,255,255,.82)}.hero-pills{display:flex;flex-wrap:wrap;gap:9px;margin-top:22px}.hero-pill{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.13);padding:8px 13px;border-radius:20px;font-size:12px}
 .section-label{color:#338447;font-size:12px;text-transform:uppercase;font-weight:800;letter-spacing:1.5px;margin-bottom:5px}.section-title{color:#173d27;font-size:27px;font-weight:800;margin-bottom:5px}.section-description{color:#6b7b70;font-size:14px;margin-bottom:20px}.crop-card,.metric-card{border-radius:18px;padding:20px;background:#fff;border:1px solid #e1ebe2;box-shadow:0 8px 25px rgba(24,70,35,.06);height:100%}.crop-icon,.metric-icon{font-size:38px}.crop-name{font-weight:800;color:#1c4930;font-size:18px}.crop-description{color:#718076;font-size:13px;line-height:1.55;margin-top:6px}.metric-title{color:#718076;font-size:12px;margin-top:8px}.metric-value{color:#1c4930;font-size:21px;font-weight:800;margin-top:2px}
 [data-testid="stFileUploader"]{background:#fff;border-radius:22px;padding:15px;border:2px dashed #b9d9be;box-shadow:0 10px 35px rgba(30,80,40,.07)}
-.result-card{background:#fff;border-radius:22px;padding:26px;border:1px solid #dfeae1;box-shadow:0 12px 35px rgba(30,80,40,.09);margin-top:10px}.result-label{font-size:11px;color:#6b7d70;text-transform:uppercase;letter-spacing:1.3px;font-weight:800}.result-value{color:#173d27;font-size:30px;font-weight:850;margin-top:3px}.healthy-result{border-left:6px solid #43a047}.disease-result{border-left:6px solid #e67e22}.info-box{background:#edf7ee;border:1px solid #d2e9d5;border-radius:16px;padding:16px 18px;color:#365c40;font-size:13px;line-height:1.6;margin-top:18px}.footer{text-align:center;margin-top:50px;padding-top:20px;border-top:1px solid #dfe8df;color:#7b8a7e;font-size:12px}.footer strong{color:#367447}.stButton>button{border-radius:12px;border:none;background:#267a40;color:white;font-weight:700}
+.result-card{background:#fff;border-radius:22px;padding:26px;border:1px solid #dfeae1;box-shadow:0 12px 35px rgba(30,80,40,.09);margin-top:10px}.result-label{font-size:11px;color:#6b7d70;text-transform:uppercase;letter-spacing:1.3px;font-weight:800}.result-value{color:#173d27;font-size:30px;font-weight:850;margin-top:3px}.healthy-result{border-left:6px solid #43a047}.disease-result{border-left:6px solid #e67e22}.rejected-result{border-left:6px solid #d64545}.inconclusive-result{border-left:6px solid #e0a800}.rejected-title{color:#8c1f1f;font-size:24px;font-weight:850;margin-top:3px}.inconclusive-title{color:#8a5a00;font-size:24px;font-weight:850;margin-top:3px}.info-box{background:#edf7ee;border:1px solid #d2e9d5;border-radius:16px;padding:16px 18px;color:#365c40;font-size:13px;line-height:1.6;margin-top:18px}.footer{text-align:center;margin-top:50px;padding-top:20px;border-top:1px solid #dfe8df;color:#7b8a7e;font-size:12px}.footer strong{color:#367447}.stButton>button{border-radius:12px;border:none;background:#267a40;color:white;font-weight:700}
 </style>
 """, unsafe_allow_html=True)
 
@@ -52,7 +64,7 @@ with st.sidebar:
     st.markdown("""<div class="sidebar-brand"><div class="sidebar-logo">🌿</div><div class="sidebar-title">AgroVision AI</div><div class="sidebar-subtitle">Intelligent crop monitoring<br>powered by deep learning</div></div>""", unsafe_allow_html=True)
     st.markdown("""<div class="sidebar-card"><div class="sidebar-card-title">⚡ System Status</div><div class="sidebar-stat"><span>AI Engine</span><span><span class="status-dot"></span>Ready</span></div><div class="sidebar-stat"><span>Crop Coverage</span><strong>2 Crops</strong></div><div class="sidebar-stat"><span>Analysis</span><strong>Automated</strong></div></div>""", unsafe_allow_html=True)
     st.markdown("""<div class="sidebar-card"><div class="sidebar-card-title">🌾 Supported Crops</div><div class="sidebar-stat"><span>🌿 Cassava</span><span>✓</span></div><div class="sidebar-stat"><span>🌽 Maize</span><span>✓</span></div></div>""", unsafe_allow_html=True)
-    st.markdown("""<div class="sidebar-card"><div class="sidebar-card-title">🤖 How It Works</div><div style="font-size:13px;line-height:1.65;opacity:.85">1. Upload a crop leaf image.<br>2. AI preprocesses the image.<br>3. Deep learning model analyzes the leaf.<br>4. Disease class is identified.<br>5. Confidence scores are displayed.</div></div>""", unsafe_allow_html=True)
+    st.markdown("""<div class="sidebar-card"><div class="sidebar-card-title">🤖 How It Works</div><div style="font-size:13px;line-height:1.65;opacity:.85">1. Upload a cassava or maize leaf image.<br>2. AI checks that the image is a leaf.<br>3. Deep learning model analyzes the leaf.<br>4. Disease class is identified.<br>5. Confidence scores are displayed.<br><br>Documents, flyers, screenshots, people and objects are rejected and never given a diagnosis.</div></div>""", unsafe_allow_html=True)
 
 st.markdown("""<div class="hero"><div class="hero-badge">✦ AI-POWERED SMART AGRICULTURE PLATFORM</div><h1 class="hero-title">Protecting Crops with <span>Intelligent Vision</span></h1><div class="hero-text">Upload a cassava or maize leaf and let our automated deep-learning system analyze it for potential diseases. Designed to support faster crop monitoring, early detection, and smarter agricultural decisions.</div><div class="hero-pills"><div class="hero-pill">🌿 Cassava Detection</div><div class="hero-pill">🌽 Maize Detection</div><div class="hero-pill">🧠 Deep Learning</div><div class="hero-pill">⚡ Automated Analysis</div></div></div>""", unsafe_allow_html=True)
 
@@ -61,6 +73,14 @@ c1,c2=st.columns(2)
 with c1: st.markdown("""<div class="crop-card"><div class="crop-icon">🌿</div><div class="crop-name">Cassava</div><div class="crop-description">Analyze cassava leaves for visible disease patterns and automatically classify the detected condition using the trained computer-vision model.</div></div>""", unsafe_allow_html=True)
 with c2: st.markdown("""<div class="crop-card"><div class="crop-icon">🌽</div><div class="crop-name">Maize</div><div class="crop-description">Screen maize leaf images for disease symptoms and receive an automated classification together with model confidence.</div></div>""", unsafe_allow_html=True)
 st.write("")
+
+
+def show_image(img, caption):
+    # Newer Streamlit uses width="stretch"; older versions use use_container_width.
+    try:
+        st.image(img, caption=caption, width="stretch")
+    except Exception:
+        st.image(img, caption=caption, use_container_width=True)
 
 
 def get_hf_token():
@@ -150,6 +170,61 @@ def load_everything():
     return model,class_names,PREPROCESS_FUNCS[best_model],img_size,best_model,source,metadata
 
 
+# ==================== INPUT VALIDATION ====================
+def check_is_leaf_image(pil_image, img_size):
+    """Model-free check that the upload looks like a photo of plant tissue.
+
+    Returns (is_leaf, reason, stats). reason is empty when the image passes.
+
+    leaf_ratio   share of pixels with a yellow-to-green hue and enough colour
+                 (covers healthy green leaves and yellowing or mosaic leaves;
+                 skin tones, sky, paper and most indoor scenes fall outside it)
+    white_ratio  share of near-white pixels
+    dominant_color_ratio
+                 share of pixels with exactly the most common RGB value (high
+                 for graphics and solid backgrounds, tiny for camera photos)
+    flat_ratio   share of pixels identical to their right and lower neighbours
+
+    The statistics are measured on the same resized image the model receives.
+    """
+    width, height = pil_image.size
+    if min(width, height) < MIN_IMAGE_SIDE:
+        return False, f"The image is too small ({width} x {height} px).", {"width": width, "height": height}
+
+    view = pil_image.convert("RGB").resize(img_size)
+    rgb = np.asarray(view, dtype=np.uint8)
+
+    hsv = np.asarray(view.convert("HSV"), dtype=np.float32)
+    hue = hsv[..., 0] * 360.0 / 255.0
+    sat = hsv[..., 1] / 255.0
+    val = hsv[..., 2] / 255.0
+    leaf = (hue >= 25) & (hue <= 165) & (sat >= 0.15) & (val >= 0.12)
+
+    white = (rgb >= 240).all(axis=2)
+
+    same_right = (rgb[:, :-1, :] == rgb[:, 1:, :]).all(axis=2)[:-1, :]
+    same_down = (rgb[:-1, :, :] == rgb[1:, :, :]).all(axis=2)[:, :-1]
+    flat = same_right & same_down
+
+    packed = (rgb[..., 0].astype(np.int32) << 16) | (rgb[..., 1].astype(np.int32) << 8) | rgb[..., 2]
+    _, counts = np.unique(packed, return_counts=True)
+
+    stats = {
+        "leaf_ratio": float(leaf.mean()),
+        "white_ratio": float(white.mean()),
+        "dominant_color_ratio": float(counts.max() / packed.size),
+        "flat_ratio": float(flat.mean()),
+    }
+
+    if stats["white_ratio"] > MAX_WHITE_RATIO:
+        return False, "The image is mostly white, like a document, flyer or screenshot.", stats
+    if stats["dominant_color_ratio"] > MAX_DOMINANT_COLOR_RATIO or stats["flat_ratio"] > MAX_FLAT_RATIO:
+        return False, "The image looks like a graphic or design, not a photograph of a leaf.", stats
+    if stats["leaf_ratio"] < MIN_LEAF_RATIO:
+        return False, "Too little of the image looks like leaf tissue.", stats
+    return True, "", stats
+
+
 def predict(model,class_names,preprocess_fn,img_size,pil_image):
     img=pil_image.convert("RGB").resize(img_size)
     x=np.expand_dims(np.asarray(img,dtype=np.float32),axis=0)
@@ -162,6 +237,26 @@ def predict(model,class_names,preprocess_fn,img_size,pil_image):
         e=np.exp(preds-np.max(preds)); preds=e/e.sum()
     idx=int(np.argmax(preds))
     return class_names[idx],float(preds[idx]),preds
+
+
+def render_rejection(status,message,stats,sorted_predictions=None):
+    """Explain why no diagnosis was made. No crop, disease or confidence is shown."""
+    if status=="not_leaf":
+        card_class,title_class,icon,title="rejected-result","rejected-title","🚫","Not a cassava or maize leaf"
+        body=("This does not look like a photo of a plant leaf, so no diagnosis was made. "
+              "Please upload a clear, well-lit photo of a single cassava or maize leaf. "
+              "Documents, flyers, screenshots, people, objects and scenery cannot be analyzed.")
+    else:
+        card_class,title_class,icon,title="inconclusive-result","inconclusive-title","⚠️","Inconclusive result"
+        body=("The image looks like a leaf, but the model could not reach a reliable result. "
+              "Try a sharper, closer, better-lit photo of one leaf against a plain background.")
+    reason=f"<br><br><strong>Reason:</strong> {html.escape(message)}" if message else ""
+    st.markdown(f'<div class="result-card {card_class}"><div style="font-size:42px;margin-bottom:8px">{icon}</div><div class="result-label">Automated Diagnosis</div><div class="{title_class}">{title}</div><div class="info-box">{html.escape(body)}{reason}</div></div>',unsafe_allow_html=True)
+    with st.expander("Technical details"):
+        if stats: st.json({k:round(v,3) for k,v in stats.items()})
+        if sorted_predictions:
+            st.write("Model probabilities (not a diagnosis):")
+            st.json({n:round(float(p)*100,2) for n,p in sorted_predictions})
 
 
 try:
@@ -182,42 +277,59 @@ st.markdown("""<div class="section-label">AUTOMATED LEAF SCANNING</div><div clas
 uploaded=st.file_uploader("Drag and drop a cassava or maize leaf image here",type=["jpg","jpeg","png"],help="Supported formats: JPG, JPEG and PNG.")
 
 if uploaded:
-    try: image=Image.open(uploaded)
+    try:
+        raw=Image.open(uploaded); image_format=raw.format
+        image=ImageOps.exif_transpose(raw)
     except Exception as e: st.error(f"Could not read the uploaded image: {e}"); st.stop()
 
     image_col,result_col=st.columns([1,1.15],gap="large")
     with image_col:
         st.markdown('<div class="section-label">INPUT IMAGE</div>',unsafe_allow_html=True)
-        st.image(image,caption="Leaf image submitted for AI analysis",use_container_width=True)
-        st.markdown(f'<div class="info-box"><strong>📷 Image received</strong><br>Resolution: {image.width} × {image.height}px<br>Format: {image.format or "Image"}</div>',unsafe_allow_html=True)
+        show_image(image,"Leaf image submitted for AI analysis")
+        st.markdown(f'<div class="info-box"><strong>📷 Image received</strong><br>Resolution: {image.width} × {image.height}px<br>Format: {image_format or "Image"}</div>',unsafe_allow_html=True)
 
-    try: label,confidence,all_preds=predict(model,class_names,preprocess_fn,img_size,image)
-    except Exception as e: st.error(f"Prediction failed: {e}"); st.stop()
+    # Step 1: is this even a leaf photo? Step 2: run the model. Step 3: is it confident enough?
+    status="ok"; message=""; stats={}; all_preds=None; label=None; confidence=0.0
+    is_leaf,message,stats=check_is_leaf_image(image,img_size)
+    if not is_leaf:
+        status="not_leaf"
+    else:
+        try: label,confidence,all_preds=predict(model,class_names,preprocess_fn,img_size,image)
+        except Exception as e: st.error(f"Prediction failed: {e}"); st.stop()
+        if confidence<MIN_CONFIDENCE:
+            status="inconclusive"
+            message=f"The top probability was {confidence*100:.1f}%, below the {MIN_CONFIDENCE*100:.0f}% minimum needed to show a diagnosis."
 
-    crop,condition=label.split("__",1) if "__" in label else ("Unknown",label)
-    clean_crop=crop.replace("_"," ").title(); clean_condition=condition.replace("_"," ").title()
-    confidence_percent=confidence*100
-    is_healthy="healthy" in condition.lower() or "normal" in condition.lower()
-    result_class="healthy-result" if is_healthy else "disease-result"
-    result_icon="✅" if is_healthy else "⚠️"
-    result_message="The AI model did not detect a disease pattern." if is_healthy else "The AI model detected a disease-associated pattern."
+    if status!="ok":
+        with result_col:
+            st.markdown('<div class="section-label">AI DIAGNOSIS</div>',unsafe_allow_html=True)
+            sorted_rej=sorted(zip(class_names,all_preds),key=lambda p:-p[1]) if all_preds is not None else None
+            render_rejection(status,message,stats,sorted_rej)
+    else:
+        crop,condition=label.split("__",1) if "__" in label else ("Unknown",label)
+        clean_crop=crop.replace("_"," ").title(); clean_condition=condition.replace("_"," ").title()
+        confidence_percent=confidence*100
+        is_healthy="healthy" in condition.lower() or "normal" in condition.lower()
+        result_class="healthy-result" if is_healthy else "disease-result"
+        result_icon="✅" if is_healthy else "⚠️"
+        result_message="The AI model did not detect a disease pattern." if is_healthy else "The AI model detected a disease-associated pattern."
 
-    with result_col:
-        st.markdown('<div class="section-label">AI DIAGNOSIS</div>',unsafe_allow_html=True)
-        st.markdown(f'<div class="result-card {result_class}"><div style="font-size:42px;margin-bottom:8px">{result_icon}</div><div class="result-label">Detected Crop</div><div class="result-value">{clean_crop}</div><div style="height:1px;background:#e7eee8;margin:17px 0"></div><div class="result-label">Automated Diagnosis</div><div class="result-value">{clean_condition}</div><div class="info-box">{result_message}</div></div>',unsafe_allow_html=True)
-        st.write("")
-        st.markdown(f'<div class="metric-card"><div style="display:flex;justify-content:space-between;align-items:center"><div><div class="metric-title">MODEL CONFIDENCE</div><div class="metric-value">{confidence_percent:.1f}%</div></div><div style="font-size:30px">🎯</div></div><div style="background:#e7eee8;height:10px;border-radius:20px;margin-top:15px;overflow:hidden"><div style="width:{min(confidence_percent,100):.1f}%;height:100%;border-radius:20px;background:linear-gradient(90deg,#81c784,#2e7d32)"></div></div></div>',unsafe_allow_html=True)
+        with result_col:
+            st.markdown('<div class="section-label">AI DIAGNOSIS</div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="result-card {result_class}"><div style="font-size:42px;margin-bottom:8px">{result_icon}</div><div class="result-label">Detected Crop</div><div class="result-value">{html.escape(clean_crop)}</div><div style="height:1px;background:#e7eee8;margin:17px 0"></div><div class="result-label">Automated Diagnosis</div><div class="result-value">{html.escape(clean_condition)}</div><div class="info-box">{result_message}</div></div>',unsafe_allow_html=True)
+            st.write("")
+            st.markdown(f'<div class="metric-card"><div style="display:flex;justify-content:space-between;align-items:center"><div><div class="metric-title">MODEL CONFIDENCE</div><div class="metric-value">{confidence_percent:.1f}%</div></div><div style="font-size:30px">🎯</div></div><div style="background:#e7eee8;height:10px;border-radius:20px;margin-top:15px;overflow:hidden"><div style="width:{min(confidence_percent,100):.1f}%;height:100%;border-radius:20px;background:linear-gradient(90deg,#81c784,#2e7d32)"></div></div></div>',unsafe_allow_html=True)
 
-    st.write(""); st.write("")
-    st.markdown('<div class="section-label">MODEL INSIGHTS</div><div class="section-title">Classification probability</div><div class="section-description">Probability assigned to each disease class by the AI model.</div>',unsafe_allow_html=True)
-    pc1,pc2=st.columns([1.2,1],gap="large")
-    sorted_predictions=sorted(zip(class_names,all_preds),key=lambda p:-p[1])
-    with pc1:
-        for name,prob in sorted_predictions:
-            display_name=name.replace("__"," → ").replace("_"," ").title(); percentage=float(prob)*100
-            st.markdown(f'<div style="margin:13px 0"><div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:13px"><span style="color:#36543e;font-weight:600">{display_name}</span><strong style="color:#267a40">{percentage:.2f}%</strong></div><div style="height:8px;background:#e6eee7;border-radius:20px;overflow:hidden"><div style="width:{min(percentage,100):.2f}%;height:100%;border-radius:20px;background:linear-gradient(90deg,#9ccc65,#2e7d32)"></div></div></div>',unsafe_allow_html=True)
-    with pc2:
-        st.markdown(f'<div class="crop-card"><div style="font-size:42px">{"🌿" if crop.lower()=="cassava" else "🌽"}</div><div class="crop-name">Automated Farm Intelligence</div><div class="crop-description">AgroVision uses computer vision and a trained deep-learning model to analyze leaf characteristics and estimate the most likely crop health condition.</div><div style="height:1px;background:#e4ece5;margin:18px 0"></div><div style="font-size:12px;color:#718076;line-height:1.7"><strong style="color:#356843">Current analysis</strong><br>Crop: {clean_crop}<br>Diagnosis: {clean_condition}<br>Confidence: {confidence_percent:.1f}%<br>AI model: {best_model_name}<br>Model source: {model_source}</div></div>',unsafe_allow_html=True)
+        st.write(""); st.write("")
+        st.markdown('<div class="section-label">MODEL INSIGHTS</div><div class="section-title">Classification probability</div><div class="section-description">Probability assigned to each disease class by the AI model.</div>',unsafe_allow_html=True)
+        pc1,pc2=st.columns([1.2,1],gap="large")
+        sorted_predictions=sorted(zip(class_names,all_preds),key=lambda p:-p[1])
+        with pc1:
+            for name,prob in sorted_predictions:
+                display_name=html.escape(name.replace("__"," → ").replace("_"," ").title()); percentage=float(prob)*100
+                st.markdown(f'<div style="margin:13px 0"><div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:13px"><span style="color:#36543e;font-weight:600">{display_name}</span><strong style="color:#267a40">{percentage:.2f}%</strong></div><div style="height:8px;background:#e6eee7;border-radius:20px;overflow:hidden"><div style="width:{min(percentage,100):.2f}%;height:100%;border-radius:20px;background:linear-gradient(90deg,#9ccc65,#2e7d32)"></div></div></div>',unsafe_allow_html=True)
+        with pc2:
+            st.markdown(f'<div class="crop-card"><div style="font-size:42px">{"🌿" if crop.lower()=="cassava" else "🌽"}</div><div class="crop-name">Automated Farm Intelligence</div><div class="crop-description">AgroVision uses computer vision and a trained deep-learning model to analyze leaf characteristics and estimate the most likely crop health condition.</div><div style="height:1px;background:#e4ece5;margin:18px 0"></div><div style="font-size:12px;color:#718076;line-height:1.7"><strong style="color:#356843">Current analysis</strong><br>Crop: {html.escape(clean_crop)}<br>Diagnosis: {html.escape(clean_condition)}<br>Confidence: {confidence_percent:.1f}%<br>AI model: {html.escape(best_model_name)}<br>Model source: {html.escape(model_source)}</div></div>',unsafe_allow_html=True)
 else:
     st.markdown('<div class="info-box"><strong>🌱 Ready for automated crop analysis?</strong><br>Upload a clear cassava or maize leaf image above. The AI system will automatically process the image, identify the most likely disease class, and display the model confidence score.</div>',unsafe_allow_html=True)
 
